@@ -193,3 +193,66 @@ exports.registerFamily = async (req, res) => {
   }
 
 };
+
+// LOGIN FLOW
+exports.loginFamily = (req, res) => {
+
+  const { first_name, second_name, third_name, password } = req.body;
+
+  if (!first_name || !second_name || !third_name || !password) {
+    return res.status(400).json({
+      message: "All fields are required"
+    });
+  }
+
+  // Find member by full name
+  const memberQuery = `
+    SELECT m.id AS member_id, m.family_id, m.role,
+           f.family_name, f.family_password
+    FROM family_members m
+    JOIN families f ON f.id = m.family_id
+    WHERE m.first_name = ? AND m.second_name = ? AND m.third_name = ?
+  `;
+
+  db.query(
+    memberQuery,
+    [first_name.trim(), second_name.trim(), third_name.trim()],
+    async (err, results) => {
+
+      if (err) {
+        return res.status(500).json({ error: err });
+      }
+
+      if (results.length === 0) {
+        return res.status(404).json({
+          message: "Member not found"
+        });
+      }
+
+      const member = results[0];
+
+      // Compare password
+      const isMatch = await bcrypt.compare(password, member.family_password);
+
+      if (!isMatch) {
+        return res.status(401).json({
+          message: "Incorrect password"
+        });
+      }
+
+      // Login success
+      res.status(200).json({
+        message: "Login successful",
+        family_id: member.family_id,
+        family_name: member.family_name,
+        member_id: member.member_id,
+        role: member.role,
+        first_name,
+        second_name,
+        third_name
+      });
+
+    }
+  );
+
+};
