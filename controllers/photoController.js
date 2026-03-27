@@ -9,27 +9,6 @@ if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
 }
 
-// Helper to check if user has access to photo
-const canAccessPhoto = (userId, userRole, photoFamilyId, userFamilyId, photoId, callback) => {
-  if (photoFamilyId !== userFamilyId) {
-    return callback(false);
-  }
-  
-  // Check if photo is shared with this user
-  const checkShareQuery = `
-    SELECT ps.id FROM photo_shares ps
-    WHERE ps.photo_id = ? AND ps.shared_with = ?
-  `;
-  
-  db.query(checkShareQuery, [photoId, userId], (err, shareResults) => {
-    if (err) return callback(false);
-    if (shareResults.length > 0) {
-      return callback(true);
-    }
-    return callback(true); // All family members can access family photos
-  });
-};
-
 // -------------------- UPLOAD SINGLE PHOTO --------------------
 exports.uploadPhoto = async (req, res) => {
   if (!req.file) {
@@ -42,7 +21,6 @@ exports.uploadPhoto = async (req, res) => {
   // Validate file type (images only)
   const allowedMimeTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp'];
   if (!allowedMimeTypes.includes(req.file.mimetype)) {
-    // Delete the uploaded file
     fs.unlinkSync(req.file.path);
     return res.status(400).json({ message: "Only image files are allowed (JPEG, PNG, GIF, WEBP, BMP)" });
   }
@@ -65,7 +43,6 @@ exports.uploadPhoto = async (req, res) => {
     ],
     (err, result) => {
       if (err) {
-        // Delete file if database insert fails
         fs.unlinkSync(req.file.path);
         return res.status(500).json({ error: err.message });
       }
@@ -94,12 +71,9 @@ exports.uploadMultiplePhotos = async (req, res) => {
     failed: []
   };
 
-  // Process each file
   for (const file of req.files) {
-    // Validate file type
     const allowedMimeTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp'];
     if (!allowedMimeTypes.includes(file.mimetype)) {
-      // Delete the uploaded file
       fs.unlinkSync(file.path);
       results.failed.push({
         filename: file.originalname,
@@ -108,7 +82,6 @@ exports.uploadMultiplePhotos = async (req, res) => {
       continue;
     }
 
-    // Insert into database
     const photoQuery = `
       INSERT INTO photos (family_id, uploaded_by, photo_name, file_path, file_size, description, tags)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -141,7 +114,6 @@ exports.uploadMultiplePhotos = async (req, res) => {
         size: file.size
       });
     } catch (err) {
-      // Delete file if database insert fails
       fs.unlinkSync(file.path);
       results.failed.push({
         filename: file.originalname,
@@ -157,15 +129,27 @@ exports.uploadMultiplePhotos = async (req, res) => {
   });
 };
 
-// -------------------- GET ALL PHOTOS --------------------
+// -------------------- GET ALL PHOTOS WITH ADVANCED FILTERS --------------------
 exports.getPhotos = (req, res) => {
   const { family_id } = req.user;
-  const { page = 1, limit = 20, tags } = req.query;
+  const { 
+    page = 1, 
+    limit = 20, 
+    tags, 
+    search, 
+    date_from, 
+    date_to,
+    uploaded_by,
+    sort_by = "created_at",
+    sort_order = "DESC"
+  } = req.query;
+  
   const offset = (page - 1) * limit;
-
+  
   let query = `
     SELECT p.*, 
-           CONCAT(m.first_name, ' ', m.second_name, ' ', m.third_name) AS uploaded_by_name
+           CONCAT(m.first_name, ' ', m.second_name, ' ', m.third_name) AS uploaded_by_name,
+           m.id as uploader_id
     FROM photos p
     JOIN family_members m ON m.id = p.uploaded_by
     WHERE p.family_id = ?
@@ -173,24 +157,81 @@ exports.getPhotos = (req, res) => {
   
   const queryParams = [family_id];
   
+  // Filter by tags (OR condition)
   if (tags) {
-    query += ` AND p.tags LIKE ?`;
-    queryParams.push(`%${tags}%`);
+    const tagArray = tags.split(',');
+    const tagConditions = tagArray.map(() => `p.tags LIKE ?`).join(' OR ');
+    query += ` AND (${tagConditions})`;
+    tagArray.forEach(tag => queryParams.push(`%${tag.trim()}%`));
   }
   
-  query += ` ORDER BY p.created_at DESC LIMIT ? OFFSET ?`;
+  // Filter by search term (searches in photo_name, description, tags)
+  if (search) {
+    query += ` AND (p.photo_name LIKE ? OR p.description LIKE ? OR p.tags LIKE ?)`;
+    const searchTerm = `%${search}%`;
+    queryParams.push(searchTerm, searchTerm, searchTerm);
+  }
+  
+  // Filter by date range
+  if (date_from) {
+    query += ` AND DATE(p.created_at) >= ?`;
+    queryParams.push(date_from);
+  }
+  
+  if (date_to) {
+    query += ` AND DATE(p.created_at) <= ?`;
+    queryParams.push(date_to);
+  }
+  
+  // Filter by uploader
+  if (uploaded_by) {
+    query += ` AND p.uploaded_by = ?`;
+    queryParams.push(uploaded_by);
+  }
+  
+  // Sorting
+  const allowedSortFields = ['created_at', 'photo_name', 'file_size', 'uploaded_by'];
+  const sortField = allowedSortFields.includes(sort_by) ? sort_by : 'created_at';
+  const sortOrder = sort_order.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+  query += ` ORDER BY p.${sortField} ${sortOrder}`;
+  
+  // Pagination
+  query += ` LIMIT ? OFFSET ?`;
   queryParams.push(parseInt(limit), parseInt(offset));
-
+  
   db.query(query, queryParams, (err, photos) => {
     if (err) return res.status(500).json({ error: err.message });
     
-    // Get total count
-    let countQuery = `SELECT COUNT(*) as total FROM photos WHERE family_id = ?`;
+    // Get total count with same filters
+    let countQuery = `SELECT COUNT(*) as total FROM photos p WHERE p.family_id = ?`;
     const countParams = [family_id];
     
     if (tags) {
-      countQuery += ` AND tags LIKE ?`;
-      countParams.push(`%${tags}%`);
+      const tagArray = tags.split(',');
+      const tagConditions = tagArray.map(() => `p.tags LIKE ?`).join(' OR ');
+      countQuery += ` AND (${tagConditions})`;
+      tagArray.forEach(tag => countParams.push(`%${tag.trim()}%`));
+    }
+    
+    if (search) {
+      countQuery += ` AND (p.photo_name LIKE ? OR p.description LIKE ? OR p.tags LIKE ?)`;
+      const searchTerm = `%${search}%`;
+      countParams.push(searchTerm, searchTerm, searchTerm);
+    }
+    
+    if (date_from) {
+      countQuery += ` AND DATE(p.created_at) >= ?`;
+      countParams.push(date_from);
+    }
+    
+    if (date_to) {
+      countQuery += ` AND DATE(p.created_at) <= ?`;
+      countParams.push(date_to);
+    }
+    
+    if (uploaded_by) {
+      countQuery += ` AND p.uploaded_by = ?`;
+      countParams.push(uploaded_by);
     }
     
     db.query(countQuery, countParams, (err, countResult) => {
@@ -198,10 +239,23 @@ exports.getPhotos = (req, res) => {
       
       res.status(200).json({
         photos,
-        total: countResult[0].total,
-        page: parseInt(page),
-        limit: parseInt(limit),
-        totalPages: Math.ceil(countResult[0].total / limit)
+        filters: {
+          tags: tags || null,
+          search: search || null,
+          date_from: date_from || null,
+          date_to: date_to || null,
+          uploaded_by: uploaded_by || null,
+          sort_by: sortField,
+          sort_order: sortOrder
+        },
+        pagination: {
+          total: countResult[0].total,
+          page: parseInt(page),
+          limit: parseInt(limit),
+          totalPages: Math.ceil(countResult[0].total / limit),
+          hasNext: parseInt(page) < Math.ceil(countResult[0].total / limit),
+          hasPrev: parseInt(page) > 1
+        }
       });
     });
   });
@@ -210,7 +264,7 @@ exports.getPhotos = (req, res) => {
 // -------------------- GET PHOTO BY ID --------------------
 exports.getPhotoById = (req, res) => {
   const { photo_id } = req.params;
-  const { member_id, family_id, role } = req.user;
+  const { family_id } = req.user;
 
   const photoQuery = `
     SELECT p.*, 
@@ -272,7 +326,6 @@ exports.deletePhoto = (req, res) => {
     
     const photo = photos[0];
     
-    // Check permissions: admin or uploader can delete
     if (photo.family_id !== family_id) {
       return res.status(403).json({ message: "Access denied" });
     }
@@ -281,12 +334,10 @@ exports.deletePhoto = (req, res) => {
       return res.status(403).json({ message: "Only admin or the uploader can delete this photo" });
     }
     
-    // Delete from database first
     const deleteQuery = `DELETE FROM photos WHERE id = ?`;
     db.query(deleteQuery, [photo_id], (err) => {
       if (err) return res.status(500).json({ error: err.message });
       
-      // Delete file from disk
       if (fs.existsSync(photo.file_path)) {
         fs.unlinkSync(photo.file_path);
       }
@@ -298,7 +349,7 @@ exports.deletePhoto = (req, res) => {
 
 // -------------------- DELETE MULTIPLE PHOTOS --------------------
 exports.deleteMultiplePhotos = (req, res) => {
-  const { photo_ids } = req.body; // Expecting an array of photo IDs
+  const { photo_ids } = req.body;
   const { member_id, family_id, role } = req.user;
 
   if (!photo_ids || !Array.isArray(photo_ids) || photo_ids.length === 0) {
@@ -314,7 +365,8 @@ exports.deleteMultiplePhotos = (req, res) => {
     failed: []
   };
 
-  // Process each photo
+  let processed = 0;
+
   photo_ids.forEach((photo_id) => {
     const photoQuery = `SELECT * FROM photos WHERE id = ?`;
     
@@ -324,17 +376,20 @@ exports.deleteMultiplePhotos = (req, res) => {
           photo_id: photo_id,
           error: err ? err.message : "Photo not found"
         });
+        processed++;
+        checkCompletion();
         return;
       }
       
       const photo = photos[0];
       
-      // Check permissions
       if (photo.family_id !== family_id) {
         results.failed.push({
           photo_id: photo_id,
           error: "Access denied"
         });
+        processed++;
+        checkCompletion();
         return;
       }
       
@@ -343,10 +398,11 @@ exports.deleteMultiplePhotos = (req, res) => {
           photo_id: photo_id,
           error: "Only admin or the uploader can delete this photo"
         });
+        processed++;
+        checkCompletion();
         return;
       }
       
-      // Delete from database
       const deleteQuery = `DELETE FROM photos WHERE id = ?`;
       db.query(deleteQuery, [photo_id], (err) => {
         if (err) {
@@ -355,7 +411,6 @@ exports.deleteMultiplePhotos = (req, res) => {
             error: err.message
           });
         } else {
-          // Delete file from disk
           if (fs.existsSync(photo.file_path)) {
             fs.unlinkSync(photo.file_path);
           }
@@ -364,18 +419,21 @@ exports.deleteMultiplePhotos = (req, res) => {
             photo_name: photo.photo_name
           });
         }
-        
-        // Check if all photos have been processed
-        if (results.successful.length + results.failed.length === photo_ids.length) {
-          res.status(200).json({
-            message: `${results.successful.length} photos deleted successfully, ${results.failed.length} failed`,
-            successful: results.successful,
-            failed: results.failed
-          });
-        }
+        processed++;
+        checkCompletion();
       });
     });
   });
+
+  function checkCompletion() {
+    if (processed === photo_ids.length) {
+      res.status(200).json({
+        message: `${results.successful.length} photos deleted successfully, ${results.failed.length} failed`,
+        successful: results.successful,
+        failed: results.failed
+      });
+    }
+  }
 };
 
 // -------------------- UPDATE PHOTO DETAILS --------------------
@@ -396,7 +454,6 @@ exports.updatePhotoDetails = (req, res) => {
       return res.status(403).json({ message: "Access denied" });
     }
     
-    // Check permissions: admin or uploader can update
     if (role !== "admin" && photo.uploaded_by !== member_id) {
       return res.status(403).json({ message: "Only admin or the uploader can update this photo" });
     }
@@ -419,22 +476,19 @@ exports.updatePhotoDetails = (req, res) => {
 exports.sharePhotoWithMember = (req, res) => {
   const { photo_id } = req.params;
   const { member_id_to_share } = req.body;
-  const { member_id, family_id, role } = req.user;
+  const { family_id } = req.user;
 
-  // Verify photo exists and belongs to user's family
   const photoQuery = `SELECT * FROM photos WHERE id = ? AND family_id = ?`;
   
   db.query(photoQuery, [photo_id, family_id], (err, photos) => {
     if (err) return res.status(500).json({ error: err.message });
     if (photos.length === 0) return res.status(404).json({ message: "Photo not found" });
     
-    // Verify the member to share with exists in the same family
     const memberQuery = `SELECT * FROM family_members WHERE id = ? AND family_id = ?`;
     db.query(memberQuery, [member_id_to_share, family_id], (err, members) => {
       if (err) return res.status(500).json({ error: err.message });
       if (members.length === 0) return res.status(404).json({ message: "Family member not found" });
       
-      // Check if already shared
       const checkShareQuery = `SELECT * FROM photo_shares WHERE photo_id = ? AND shared_with = ?`;
       db.query(checkShareQuery, [photo_id, member_id_to_share], (err, existing) => {
         if (err) return res.status(500).json({ error: err.message });
@@ -442,7 +496,6 @@ exports.sharePhotoWithMember = (req, res) => {
           return res.status(400).json({ message: "Photo already shared with this member" });
         }
         
-        // Create share record
         const shareQuery = `INSERT INTO photo_shares (photo_id, shared_with) VALUES (?, ?)`;
         db.query(shareQuery, [photo_id, member_id_to_share], (err) => {
           if (err) return res.status(500).json({ error: err.message });
@@ -457,16 +510,14 @@ exports.sharePhotoWithMember = (req, res) => {
 exports.getShareableLink = (req, res) => {
   const { photo_id } = req.params;
   const { member_id, family_id } = req.user;
-  const { expires_in_hours = 168 } = req.query; // Default 7 days
+  const { expires_in_hours = 168 } = req.query;
 
-  // Verify photo exists and belongs to user's family
   const photoQuery = `SELECT * FROM photos WHERE id = ? AND family_id = ?`;
   
   db.query(photoQuery, [photo_id, family_id], (err, photos) => {
     if (err) return res.status(500).json({ error: err.message });
     if (photos.length === 0) return res.status(404).json({ message: "Photo not found" });
     
-    // Generate unique token
     const shareToken = crypto.randomBytes(32).toString('hex');
     const expiresAt = expires_in_hours ? new Date(Date.now() + expires_in_hours * 60 * 60 * 1000) : null;
     
@@ -505,7 +556,6 @@ exports.downloadSharedPhoto = (req, res) => {
     
     const link = links[0];
     
-    // Check if link has expired
     if (link.expires_at && new Date() > new Date(link.expires_at)) {
       return res.status(410).json({ message: "Share link has expired" });
     }
@@ -538,8 +588,7 @@ exports.getPhotosByTags = (req, res) => {
   
   const queryParams = [family_id];
   
-  // Add conditions for each tag
-  tagArray.forEach((tag, index) => {
+  tagArray.forEach((tag) => {
     query += ` AND p.tags LIKE ?`;
     queryParams.push(`%${tag.trim()}%`);
   });
@@ -549,5 +598,162 @@ exports.getPhotosByTags = (req, res) => {
   db.query(query, queryParams, (err, photos) => {
     if (err) return res.status(500).json({ error: err.message });
     res.status(200).json(photos);
+  });
+};
+
+// -------------------- GET FILTER OPTIONS --------------------
+exports.getFilterOptions = (req, res) => {
+  const { family_id } = req.user;
+  
+  const tagsQuery = `
+    SELECT DISTINCT tags 
+    FROM photos 
+    WHERE family_id = ? AND tags IS NOT NULL AND tags != ''
+  `;
+  
+  const membersQuery = `
+    SELECT id, first_name, second_name, third_name 
+    FROM family_members 
+    WHERE family_id = ?
+  `;
+  
+  const dateRangeQuery = `
+    SELECT 
+      MIN(DATE(created_at)) as earliest_date,
+      MAX(DATE(created_at)) as latest_date
+    FROM photos 
+    WHERE family_id = ?
+  `;
+  
+  Promise.all([
+    new Promise((resolve, reject) => {
+      db.query(tagsQuery, [family_id], (err, results) => {
+        if (err) reject(err);
+        else {
+          const allTags = [];
+          results.forEach(row => {
+            if (row.tags) {
+              const tags = row.tags.split(',').map(t => t.trim());
+              tags.forEach(tag => {
+                if (tag && !allTags.includes(tag)) allTags.push(tag);
+              });
+            }
+          });
+          resolve(allTags.sort());
+        }
+      });
+    }),
+    new Promise((resolve, reject) => {
+      db.query(membersQuery, [family_id], (err, results) => {
+        if (err) reject(err);
+        else {
+          const members = results.map(m => ({
+            id: m.id,
+            name: `${m.first_name} ${m.second_name} ${m.third_name}`.trim()
+          }));
+          resolve(members);
+        }
+      });
+    }),
+    new Promise((resolve, reject) => {
+      db.query(dateRangeQuery, [family_id], (err, results) => {
+        if (err) reject(err);
+        else resolve(results[0] || { earliest_date: null, latest_date: null });
+      });
+    })
+  ]).then(([tags, members, dateRange]) => {
+    res.status(200).json({
+      tags: tags,
+      members: members,
+      date_range: {
+        from: dateRange.earliest_date,
+        to: dateRange.latest_date
+      }
+    });
+  }).catch(err => {
+    res.status(500).json({ error: err.message });
+  });
+};
+
+// -------------------- GET PHOTOS BY MONTH/YEAR --------------------
+exports.getPhotosByMonth = (req, res) => {
+  const { family_id } = req.user;
+  const { year, month } = req.query;
+  
+  if (!year) {
+    return res.status(400).json({ message: "Year parameter required" });
+  }
+  
+  let query = `
+    SELECT p.*, 
+           CONCAT(m.first_name, ' ', m.second_name, ' ', m.third_name) AS uploaded_by_name,
+           DATE_FORMAT(p.created_at, '%Y-%m') as month_year
+    FROM photos p
+    JOIN family_members m ON m.id = p.uploaded_by
+    WHERE p.family_id = ? AND YEAR(p.created_at) = ?
+  `;
+  
+  const queryParams = [family_id, year];
+  
+  if (month) {
+    query += ` AND MONTH(p.created_at) = ?`;
+    queryParams.push(month);
+  }
+  
+  query += ` ORDER BY p.created_at DESC`;
+  
+  db.query(query, queryParams, (err, photos) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.status(200).json(photos);
+  });
+};
+
+// -------------------- GET PHOTO STATISTICS --------------------
+exports.getPhotoStats = (req, res) => {
+  const { family_id } = req.user;
+  
+  const statsQuery = `
+    SELECT 
+      DATE_FORMAT(created_at, '%Y-%m') as month,
+      COUNT(*) as photos_uploaded,
+      SUM(file_size) as total_size_bytes
+    FROM photos
+    WHERE family_id = ?
+    GROUP BY DATE_FORMAT(created_at, '%Y-%m')
+    ORDER BY month DESC
+    LIMIT 12
+  `;
+  
+  db.query(statsQuery, [family_id], (err, monthlyStats) => {
+    if (err) return res.status(500).json({ error: err.message });
+    
+    const totalSizeQuery = `
+      SELECT 
+        COUNT(*) as total_photos,
+        SUM(file_size) as total_size_bytes,
+        COUNT(DISTINCT uploaded_by) as total_contributors
+      FROM photos 
+      WHERE family_id = ?
+    `;
+    
+    db.query(totalSizeQuery, [family_id], (err, totals) => {
+      if (err) return res.status(500).json({ error: err.message });
+      
+      const summary = totals[0] || { total_photos: 0, total_size_bytes: 0, total_contributors: 0 };
+      
+      res.status(200).json({
+        summary: {
+          total_photos: summary.total_photos,
+          total_size_bytes: summary.total_size_bytes,
+          total_size_mb: ((summary.total_size_bytes || 0) / (1024 * 1024)).toFixed(2),
+          total_contributors: summary.total_contributors
+        },
+        monthly_breakdown: monthlyStats.map(stat => ({
+          month: stat.month,
+          photos_uploaded: stat.photos_uploaded,
+          total_size_mb: ((stat.total_size_bytes || 0) / (1024 * 1024)).toFixed(2)
+        }))
+      });
+    });
   });
 };

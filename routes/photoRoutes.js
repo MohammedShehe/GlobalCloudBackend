@@ -34,17 +34,26 @@ const upload = multer({
   fileFilter: fileFilter
 });
 
-// Auth-protected endpoints
+// Upload endpoints
 router.post("/upload", authenticateToken, upload.single("photo"), photoController.uploadPhoto);
 router.post("/upload-multiple", authenticateToken, upload.array("photos", 20), photoController.uploadMultiplePhotos);
+
+// Filter and search endpoints
 router.get("/all", authenticateToken, photoController.getPhotos);
+router.get("/filter-options", authenticateToken, photoController.getFilterOptions);
+router.get("/by-month", authenticateToken, photoController.getPhotosByMonth);
+router.get("/stats", authenticateToken, photoController.getPhotoStats);
+router.get("/tags/search", authenticateToken, photoController.getPhotosByTags);
+
+// Single photo operations
 router.get("/:photo_id", authenticateToken, photoController.getPhotoById);
 router.get("/download/:photo_id", authenticateToken, photoController.downloadPhoto);
 router.delete("/:photo_id", authenticateToken, photoController.deletePhoto);
-router.post("/delete-multiple", authenticateToken, photoController.deleteMultiplePhotos);
 router.put("/:photo_id", authenticateToken, photoController.updatePhotoDetails);
+
+// Sharing endpoints
 router.post("/:photo_id/share", authenticateToken, photoController.sharePhotoWithMember);
-router.get("/tags/search", authenticateToken, photoController.getPhotosByTags);
+router.post("/delete-multiple", authenticateToken, photoController.deleteMultiplePhotos);
 
 // Social media shareable links
 router.get("/shareLink/:photo_id", authenticateToken, photoController.getShareableLink);
